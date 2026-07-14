@@ -2,8 +2,4 @@ streamlit
 pandas
 numpy
 openpyxl
-python-calamine
 xlrd
-beautifulsoup4
-lxml
-html5lib

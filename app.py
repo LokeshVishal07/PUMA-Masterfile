@@ -1,6 +1,6 @@
 """
-PUMA ZeCom Column Mapper
-=========================
+PUMA ZeCom Column Mapper (v2 — robust reader)
+===============================================
 Upload a MARKETPLACE file (Lazada / Shopee / Zalora / TikTok) that only has EAN
 (Seller SKU) at the row level, and get back the SAME file with ZeCom pricing
 (and any other ZeCom columns you choose) mapped in.
@@ -8,11 +8,26 @@ Upload a MARKETPLACE file (Lazada / Shopee / Zalora / TikTok) that only has EAN
 JOIN CHAIN (ZeCom has no EAN, so we bridge through Content):
   Marketplace EAN  --(Content file)-->  Color No / Article No  --(ZeCom file)-->  Selected columns
 
-Output = original marketplace file, same rows/columns/order, with new columns appended.
+v2 changes (built after real ZeCom tracker files were tested):
+  - Multi-engine, format-sniffing file reader (openpyxl / calamine / xlrd / HTML-in-disguise),
+    with graceful fallback and a clear "what was tried" error message instead of one confusing
+    engine-import error.
+  - Sheet picker (ZeCom trackers frequently bundle MY + SG in one file, PH in another).
+  - Header row is auto-detected AND manually overridable, with a raw-row preview, because
+    tracker layouts change often and auto-detection can guess wrong.
+  - Repeated column names (e.g. "MY RRP" appearing 6x for 6 different campaign tiers) are
+    now handled: each gets a unique internal name plus a human label that includes the
+    campaign/tier banner text sitting above it and its real Excel column letter, so nothing
+    silently collides or gets overwritten.
+  - Wider key-matching hints (Style#, PIM Article#, PIM_Article#, Color No, etc.) since this
+    varies by region/file.
+  - Optional key normalization (trim/uppercase/strip stray .0) to catch near-miss key mismatches.
 """
 
 import io
 import re
+from collections import Counter
+
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -20,28 +35,75 @@ import streamlit as st
 st.set_page_config(page_title="ZeCom Column Mapper", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Low-level file reading — format sniffing + multi-engine fallback
 # ---------------------------------------------------------------------------
 
-def clean_id_str(val):
-    """Turn 18890032587.0 -> '18890032587', keep strings/blank as-is."""
-    if pd.isna(val):
-        return None
-    if isinstance(val, float):
-        if val.is_integer():
-            return str(int(val))
-        return str(val)
-    s = str(val).strip()
-    if s == "" or s.lower() == "nan":
-        return None
-    # strip trailing .0 artifacts that survive as strings
-    if re.fullmatch(r"\d+\.0", s):
-        s = s[:-2]
-    return s
+def _looks_like_html(b: bytes) -> bool:
+    head = b[:512].lstrip().lower()
+    return head.startswith(b"<html") or head.startswith(b"<!doctype") or b"<table" in head[:2000].lower()
+
+
+def _sniff_kind(b: bytes) -> str:
+    if b[:4] == b"PK\x03\x04":
+        return "zip"       # genuine .xlsx/.xlsm (OOXML)
+    if b[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return "ole"        # legacy .xls
+    if _looks_like_html(b):
+        return "html"        # many marketplace "xlsx" exports are actually HTML tables
+    return "unknown"
+
+
+@st.cache_data(show_spinner=False)
+def list_sheets(file_bytes, filename):
+    """
+    Try each engine/format in turn just to enumerate sheet names.
+    Returns (engine_used, sheet_names, attempt_log).
+    engine_used is one of: 'openpyxl', 'calamine', 'xlrd', 'html', 'csv'
+    """
+    attempts = []
+    kind = _sniff_kind(file_bytes)
+
+    if filename.lower().endswith(".csv"):
+        return "csv", ["(csv)"], ["Detected .csv extension"]
+
+    engine_order = ["openpyxl", "calamine", "xlrd"]
+    for engine in engine_order:
+        try:
+            xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
+            return engine, xls.sheet_names, attempts + [f"{engine}: OK"]
+        except ImportError:
+            attempts.append(f"{engine}: not installed (pip install {('python-calamine' if engine=='calamine' else engine)})")
+        except Exception as e:
+            attempts.append(f"{engine}: {type(e).__name__}: {e}")
+
+    if kind == "html" or True:  # always try html as last resort even if kind unknown
+        try:
+            tables = pd.read_html(io.BytesIO(file_bytes))
+            if tables:
+                return "html", [f"Sheet1 ({len(tables)} table(s) found, using 1st)"], attempts + ["html: OK"]
+        except Exception as e:
+            attempts.append(f"html: {type(e).__name__}: {e}")
+
+    return None, [], attempts
+
+
+@st.cache_data(show_spinner=False)
+def read_raw_grid(file_bytes, filename, engine, sheet_name):
+    """Read a sheet as a raw, header-less grid of strings for header-row inspection."""
+    bio = io.BytesIO(file_bytes)
+    if engine == "csv":
+        raw = pd.read_csv(bio, header=None, dtype=str)
+    elif engine == "html":
+        tables = pd.read_html(bio, header=None)
+        raw = tables[0]
+        raw.columns = range(raw.shape[1])
+    else:
+        raw = pd.read_excel(bio, sheet_name=sheet_name, header=None, dtype=str, engine=engine)
+        raw.columns = range(raw.shape[1])
+    return raw
 
 
 def excel_col_letter(idx: int) -> str:
-    """0-indexed column position -> Excel column letter (A, B, ..., AA, ...)."""
     letters = ""
     idx += 1
     while idx > 0:
@@ -50,8 +112,7 @@ def excel_col_letter(idx: int) -> str:
     return letters
 
 
-def find_header_row(raw_df: pd.DataFrame, keywords, max_scan=15):
-    """Scan first N rows for a row containing enough keyword hits to be a header."""
+def find_header_row(raw_df: pd.DataFrame, keywords, max_scan=20):
     best_row, best_hits = 0, -1
     for i in range(min(max_scan, len(raw_df))):
         row_vals = [str(v).strip().lower() for v in raw_df.iloc[i].tolist()]
@@ -61,37 +122,71 @@ def find_header_row(raw_df: pd.DataFrame, keywords, max_scan=15):
     return best_row
 
 
-@st.cache_data(show_spinner=False)
-def read_any_excel(file_bytes, filename, header_hint_keywords, sheet_name=None):
+def build_headered_df(raw: pd.DataFrame, header_row: int):
     """
-    Robust reader: tries a couple of engines, auto-detects the header row by
-    scanning for keyword hits (handles double-header / banner-row exports).
-    Returns (dataframe, detected_header_row_index).
+    Turn a raw grid + chosen header row into a usable dataframe where every
+    column name is guaranteed unique, plus a {col_name: display_label} map that
+    folds in the banner text from the row directly above the header (common in
+    ZeCom trackers where a campaign name spans several repeated sub-columns)
+    and the real Excel column letter for traceability back to the source file.
     """
-    bio = io.BytesIO(file_bytes)
-    engines_to_try = ["openpyxl", "calamine"]
-    last_err = None
-    for engine in engines_to_try:
-        try:
-            bio.seek(0)
-            if filename.lower().endswith(".csv"):
-                raw = pd.read_csv(bio, header=None, dtype=str)
-            else:
-                xls = pd.ExcelFile(bio, engine=engine)
-                sheet = sheet_name if sheet_name in xls.sheet_names else xls.sheet_names[0]
-                raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=str)
-            header_row = find_header_row(raw, header_hint_keywords)
-            df = raw.iloc[header_row + 1:].copy()
-            df.columns = [str(c).strip() for c in raw.iloc[header_row].tolist()]
-            df = df.dropna(axis=1, how="all")
-            df = df.loc[:, ~df.columns.str.fullmatch(r"nan|None|", case=False, na=False)]
-            df = df.reset_index(drop=True)
-            return df, header_row
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"Could not read {filename}: {last_err}")
+    banner_row = raw.iloc[header_row - 1].tolist() if header_row > 0 else [None] * raw.shape[1]
+    header_vals = raw.iloc[header_row].tolist()
 
+    raw_names = []
+    for i, h in enumerate(header_vals):
+        h_str = str(h).strip() if pd.notna(h) and str(h).strip().lower() not in ("", "nan", "none") else None
+        raw_names.append(h_str or f"Col_{excel_col_letter(i)}")
+
+    name_counts = Counter(raw_names)
+    seen = Counter()
+    final_names, labels = [], {}
+    for i, name in enumerate(raw_names):
+        letter = excel_col_letter(i)
+        banner_val = banner_row[i] if i < len(banner_row) else None
+        banner_str = str(banner_val).strip() if pd.notna(banner_val) and str(banner_val).strip().lower() not in ("", "nan", "none") else ""
+
+        if name_counts[name] > 1:
+            unique_name = f"{name}__{letter}"
+        else:
+            unique_name = name
+        final_names.append(unique_name)
+
+        label = f"{letter}: "
+        if banner_str:
+            label += f"{banner_str} — {name}"
+        else:
+            label += name
+        labels[unique_name] = label
+
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = final_names
+    # drop fully-empty columns (but keep names unique already established)
+    df = df.dropna(axis=1, how="all")
+    df = df.reset_index(drop=True)
+    labels = {k: v for k, v in labels.items() if k in df.columns}
+    return df, labels
+
+
+def clean_id_str(val, normalize=False):
+    if pd.isna(val):
+        return None
+    if isinstance(val, float):
+        s = str(int(val)) if val.is_integer() else str(val)
+    else:
+        s = str(val).strip()
+        if s == "" or s.lower() == "nan":
+            return None
+        if re.fullmatch(r"\d+\.0+", s):
+            s = s.split(".")[0]
+    if normalize:
+        s = s.strip().upper()
+    return s if s != "" else None
+
+
+# ---------------------------------------------------------------------------
+# Column-guessing hints
+# ---------------------------------------------------------------------------
 
 MARKETPLACE_EAN_COLUMN_HINTS = {
     "Lazada": ["sellersku", "seller sku"],
@@ -99,25 +194,93 @@ MARKETPLACE_EAN_COLUMN_HINTS = {
     "Zalora": ["sellersku", "seller sku"],
     "TikTok Shop": ["seller sku"],
 }
+MARKETPLACE_HEADER_HINTS = ["sellersku", "seller sku", "sku", "product", "seller"]
 
 CONTENT_EAN_HINTS = ["ean"]
-CONTENT_PARENT_HINTS = ["color no", "article no", "colorno", "articleno"]
-ZECOM_PARENT_HINTS = ["pim_article", "pim article", "article no", "articleno"]
+CONTENT_PARENT_HINTS = ["color no", "article no", "colorno", "articleno", "style#", "style #"]
+CONTENT_HEADER_HINTS = CONTENT_EAN_HINTS + CONTENT_PARENT_HINTS
+
+ZECOM_PARENT_HINTS = [
+    "pim article", "pim_article", "pim style",
+    "article no", "articleno", "color no", "colorno",
+    "style#", "style #",
+]
+ZECOM_HEADER_HINTS = ZECOM_PARENT_HINTS + ["price", "srp", "rrp", "md price"]
 
 
 def guess_column(columns, hints):
+    """
+    Hint-priority order matters: e.g. for ZeCom files "PIM Article#" (has the
+    color suffix, the correct join key) must win over "PIM Style" (truncated,
+    wrong), even though "PIM Style" is an *exact* match for a lower-priority
+    hint and "PIM Article#" is only a *substring* match for the higher-priority
+    hint. So for each hint (highest priority first) we check both exact and
+    substring matches before ever moving on to the next hint.
+    """
     cols_lower = {c: str(c).strip().lower() for c in columns}
-    # exact-ish match first
-    for c, cl in cols_lower.items():
-        for h in hints:
+    for h in hints:
+        for c, cl in cols_lower.items():
             if cl == h:
                 return c
-    # then contains
-    for c, cl in cols_lower.items():
-        for h in hints:
+        for c, cl in cols_lower.items():
             if h in cl:
                 return c
     return None
+
+
+# ---------------------------------------------------------------------------
+# Reusable "upload + configure" block for one file
+# ---------------------------------------------------------------------------
+
+def configure_file(label, uploaded_file, header_hints, key_prefix, default_sheet_hint=None):
+    """
+    Full pipeline for one uploaded file: sheet pick -> raw preview -> header row
+    (auto + manual override) -> build final dataframe + label map.
+    Returns (df, labels) or (None, None) if not ready.
+    """
+    if uploaded_file is None:
+        return None, None
+
+    file_bytes = uploaded_file.getvalue()
+    engine, sheet_names, attempt_log = list_sheets(file_bytes, uploaded_file.name)
+
+    if engine is None:
+        st.error(
+            f"**Could not read {label}.** Tried multiple formats and none worked:\n\n"
+            + "\n".join(f"- {a}" for a in attempt_log)
+            + "\n\nIf this is a genuine Excel file, try re-saving it as .xlsx from Excel first. "
+            "If it was exported from a marketplace seller center, some exports are actually "
+            "HTML tables saved with an .xlsx extension — try opening and re-saving it in Excel."
+        )
+        return None, None
+
+    sheet_name = sheet_names[0]
+    if len(sheet_names) > 1:
+        default_idx = 0
+        if default_sheet_hint:
+            for i, s in enumerate(sheet_names):
+                if default_sheet_hint.lower() == str(s).lower():
+                    default_idx = i
+                    break
+        sheet_name = st.selectbox(f"{label} — sheet", options=sheet_names, index=default_idx, key=f"{key_prefix}_sheet")
+
+    raw = read_raw_grid(file_bytes, uploaded_file.name, engine, sheet_name)
+
+    auto_header_row = find_header_row(raw, header_hints)
+    with st.expander(f"Preview raw rows of {label} (use this to check/pick the header row)"):
+        st.dataframe(raw.head(12), use_container_width=True, height=250)
+
+    header_row = st.number_input(
+        f"{label} — which row number is the actual header? (0 = first row)",
+        min_value=0,
+        max_value=max(0, len(raw) - 2),
+        value=int(auto_header_row),
+        key=f"{key_prefix}_header_row",
+        help="Auto-detected based on keyword matches. Override if the tracker layout changed and this guessed wrong.",
+    )
+
+    df, labels = build_headered_df(raw, int(header_row))
+    return df, labels
 
 
 # ---------------------------------------------------------------------------
@@ -140,103 +303,108 @@ with st.sidebar:
     content_file = st.file_uploader("Content file (EAN → Color No)", type=["xlsx", "xls", "csv"])
     zecom_file = st.file_uploader("ZeCom file (pricing etc.)", type=["xlsx", "xls", "csv"])
 
-# ---------------------------------------------------------------------------
-# Main flow
-# ---------------------------------------------------------------------------
+    st.header("3. Options")
+    normalize_keys = st.checkbox(
+        "Normalize join keys (trim spaces, uppercase, strip stray .0)",
+        value=True,
+        help="Turn on if rows aren't matching due to minor formatting differences between files.",
+    )
 
 if not (mp_file and content_file and zecom_file):
     st.info("Upload all three files in the sidebar to get started.")
     st.stop()
 
-# --- Read Marketplace file ---
-mp_ean_hints = MARKETPLACE_EAN_COLUMN_HINTS[marketplace]
-try:
-    mp_df, mp_header_row = read_any_excel(
-        mp_file.getvalue(), mp_file.name, mp_ean_hints + ["seller", "sku", "product"]
-    )
-except Exception as e:
-    st.error(f"Could not read the marketplace file: {e}")
-    st.stop()
-
-mp_ean_col = guess_column(mp_df.columns, mp_ean_hints)
+# ---------------------------------------------------------------------------
+# Step 1 — Marketplace file
+# ---------------------------------------------------------------------------
 
 st.subheader("Step 1 — Marketplace file")
-c1, c2 = st.columns([2, 1])
-with c1:
-    mp_ean_col = st.selectbox(
-        "Which column is the EAN / Seller SKU?",
-        options=list(mp_df.columns),
-        index=list(mp_df.columns).index(mp_ean_col) if mp_ean_col in mp_df.columns else 0,
-    )
-with c2:
-    st.metric("Rows detected", len(mp_df))
-st.dataframe(mp_df.head(5), use_container_width=True, height=180)
-
-# --- Read Content file ---
-try:
-    content_df, content_header_row = read_any_excel(
-        content_file.getvalue(), content_file.name, CONTENT_EAN_HINTS + CONTENT_PARENT_HINTS
-    )
-except Exception as e:
-    st.error(f"Could not read the Content file: {e}")
+mp_ean_hints = MARKETPLACE_EAN_COLUMN_HINTS[marketplace]
+mp_df, mp_labels = configure_file(
+    f"Marketplace file ({marketplace})", mp_file, MARKETPLACE_HEADER_HINTS, "mp"
+)
+if mp_df is None:
     st.stop()
 
-content_ean_col = guess_column(content_df.columns, CONTENT_EAN_HINTS)
-content_parent_col = guess_column(content_df.columns, CONTENT_PARENT_HINTS)
+mp_ean_guess = guess_column(mp_df.columns, mp_ean_hints)
+mp_ean_col = st.selectbox(
+    "Which column is the EAN / Seller SKU?",
+    options=list(mp_df.columns),
+    index=list(mp_df.columns).index(mp_ean_guess) if mp_ean_guess in mp_df.columns else 0,
+    format_func=lambda c: mp_labels.get(c, c),
+)
+st.dataframe(mp_df.head(5), use_container_width=True, height=180)
 
+# ---------------------------------------------------------------------------
+# Step 2 — Content file
+# ---------------------------------------------------------------------------
+
+st.divider()
 st.subheader("Step 2 — Content file (bridge: EAN → Color No)")
+content_df, content_labels = configure_file(
+    "Content file", content_file, CONTENT_HEADER_HINTS, "content"
+)
+if content_df is None:
+    st.stop()
+
+content_ean_guess = guess_column(content_df.columns, CONTENT_EAN_HINTS)
+content_parent_guess = guess_column(content_df.columns, CONTENT_PARENT_HINTS)
+
 cc1, cc2 = st.columns(2)
 with cc1:
     content_ean_col = st.selectbox(
         "EAN column in Content file",
         options=list(content_df.columns),
-        index=list(content_df.columns).index(content_ean_col) if content_ean_col in content_df.columns else 0,
+        index=list(content_df.columns).index(content_ean_guess) if content_ean_guess in content_df.columns else 0,
+        format_func=lambda c: content_labels.get(c, c),
     )
 with cc2:
     content_parent_col = st.selectbox(
-        "Color No / Article No column in Content file",
+        "Color No / Article No / Style# column in Content file",
         options=list(content_df.columns),
-        index=list(content_df.columns).index(content_parent_col) if content_parent_col in content_df.columns else 0,
+        index=list(content_df.columns).index(content_parent_guess) if content_parent_guess in content_df.columns else 0,
+        format_func=lambda c: content_labels.get(c, c),
     )
 st.dataframe(content_df[[content_ean_col, content_parent_col]].head(5), use_container_width=True, height=150)
 
-# --- Read ZeCom file ---
-try:
-    zecom_df, zecom_header_row = read_any_excel(
-        zecom_file.getvalue(), zecom_file.name, ZECOM_PARENT_HINTS + ["price", "srp"]
-    )
-except Exception as e:
-    st.error(f"Could not read the ZeCom file: {e}")
+# ---------------------------------------------------------------------------
+# Step 3 — ZeCom file
+# ---------------------------------------------------------------------------
+
+st.divider()
+st.subheader("Step 3 — ZeCom file (pricing + other columns)")
+zecom_df, zecom_labels = configure_file(
+    "ZeCom file", zecom_file, ZECOM_HEADER_HINTS, "zecom", default_sheet_hint=region
+)
+if zecom_df is None:
     st.stop()
 
-zecom_parent_col = guess_column(zecom_df.columns, ZECOM_PARENT_HINTS)
+zecom_parent_guess = guess_column(zecom_df.columns, ZECOM_PARENT_HINTS)
+zecom_parent_col = st.selectbox(
+    "PIM_Article# / Color No / Style# column in ZeCom file",
+    options=list(zecom_df.columns),
+    index=list(zecom_df.columns).index(zecom_parent_guess) if zecom_parent_guess in zecom_df.columns else 0,
+    format_func=lambda c: zecom_labels.get(c, c),
+)
 
-st.subheader("Step 3 — ZeCom file (pricing + other columns)")
-zc1, zc2 = st.columns([1, 2])
-with zc1:
-    zecom_parent_col = st.selectbox(
-        "PIM_Article# / Color No column in ZeCom file",
-        options=list(zecom_df.columns),
-        index=list(zecom_df.columns).index(zecom_parent_col) if zecom_parent_col in zecom_df.columns else 0,
-    )
-
-# Dynamic column selector, labelled with real Excel column letters like the voucher tool
 other_zecom_cols = [c for c in zecom_df.columns if c != zecom_parent_col]
-col_labels = {c: f"{excel_col_letter(list(zecom_df.columns).index(c))}: {c}" for c in zecom_df.columns}
-
-with zc2:
-    selected_zecom_cols = st.multiselect(
-        "Which ZeCom columns do you want mapped into the output?",
-        options=other_zecom_cols,
-        default=[c for c in other_zecom_cols if any(k in str(c).lower() for k in ["price", "srp", "mrp"])][:3],
-        format_func=lambda c: col_labels.get(c, c),
-    )
-
-st.dataframe(zecom_df[[zecom_parent_col] + selected_zecom_cols].head(5), use_container_width=True, height=150)
+st.caption(
+    "Tracker columns often repeat per campaign tier (BAU / Payday / Mega / Shopee-specific, etc). "
+    "Each option below shows its real Excel column letter and the campaign banner text above it — "
+    "use that to pick the right tier(s)."
+)
+selected_zecom_cols = st.multiselect(
+    "Which ZeCom columns do you want mapped into the output?",
+    options=other_zecom_cols,
+    format_func=lambda c: zecom_labels.get(c, c),
+)
 
 if not selected_zecom_cols:
-    st.warning("Pick at least one ZeCom column to map, then results will appear below.")
+    st.warning("Pick at least one ZeCom column above to see mapped results.")
+    st.dataframe(zecom_df.head(5), use_container_width=True, height=180)
     st.stop()
+
+st.dataframe(zecom_df[[zecom_parent_col] + selected_zecom_cols].head(5), use_container_width=True, height=150)
 
 # ---------------------------------------------------------------------------
 # Build the join
@@ -245,24 +413,19 @@ if not selected_zecom_cols:
 st.divider()
 st.subheader("Step 4 — Mapped output")
 
-# Clean join keys
-mp_df["_EAN_KEY"] = mp_df[mp_ean_col].apply(clean_id_str)
-content_df["_EAN_KEY"] = content_df[content_ean_col].apply(clean_id_str)
-content_df["_PARENT_KEY"] = content_df[content_parent_col].apply(clean_id_str)
-zecom_df["_PARENT_KEY"] = zecom_df[zecom_parent_col].apply(clean_id_str)
+mp_df["_EAN_KEY"] = mp_df[mp_ean_col].apply(lambda v: clean_id_str(v, normalize_keys))
+content_df["_EAN_KEY"] = content_df[content_ean_col].apply(lambda v: clean_id_str(v, normalize_keys))
+content_df["_PARENT_KEY"] = content_df[content_parent_col].apply(lambda v: clean_id_str(v, normalize_keys))
+zecom_df["_PARENT_KEY"] = zecom_df[zecom_parent_col].apply(lambda v: clean_id_str(v, normalize_keys))
 
-# Flag duplicate PIM_Article# entries in ZeCom (data-quality flag, not silently resolved)
 dup_parents = zecom_df["_PARENT_KEY"].value_counts()
 dup_parents = set(dup_parents[dup_parents > 1].index) - {None}
 
-# EAN -> Color No (first match; flag if an EAN maps to multiple parents)
 ean_to_parent = (
     content_df.dropna(subset=["_EAN_KEY"])
     .drop_duplicates(subset=["_EAN_KEY"], keep="first")
     .set_index("_EAN_KEY")["_PARENT_KEY"]
 )
-
-# Color No -> selected ZeCom columns (first match if duplicates, since duplicates are flagged separately)
 zecom_lookup = (
     zecom_df.dropna(subset=["_PARENT_KEY"])
     .drop_duplicates(subset=["_PARENT_KEY"], keep="first")
@@ -270,10 +433,8 @@ zecom_lookup = (
 )
 
 mp_df["_PARENT_KEY"] = mp_df["_EAN_KEY"].map(ean_to_parent)
-
 mapped = mp_df.join(zecom_lookup, on="_PARENT_KEY")
 
-# Not Available handling — never silently blank
 for c in selected_zecom_cols:
     mapped[c] = mapped[c].where(mapped["_PARENT_KEY"].notna(), "Not Available (no EAN→Color No match)")
     mapped[c] = mapped[c].where(
@@ -284,17 +445,17 @@ mapped["ZeCom_Duplicate_Flag"] = mapped["_PARENT_KEY"].apply(
     lambda k: "⚠ Multiple ZeCom entries for this Color No" if k in dup_parents else ""
 )
 
+output_label_map = {c: zecom_labels.get(c, c) for c in selected_zecom_cols}
 output_cols = list(mp_df.columns.drop(["_EAN_KEY", "_PARENT_KEY"])) + selected_zecom_cols + ["ZeCom_Duplicate_Flag"]
 final_df = mapped[output_cols].copy()
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+# Give the appended ZeCom columns their descriptive labels in the actual output file
+final_df = final_df.rename(columns=output_label_map)
 
 total_rows = len(final_df)
 no_content_match = int((mapped["_PARENT_KEY"].isna()).sum())
+first_sel = selected_zecom_cols[0]
 no_zecom_match = int(
-    ((mapped["_PARENT_KEY"].notna()) & (mapped[selected_zecom_cols[0]].astype(str).str.startswith("Not Available"))).sum()
+    ((mapped["_PARENT_KEY"].notna()) & (mapped[first_sel].astype(str).str.startswith("Not Available"))).sum()
 )
 dup_hits = int((mapped["ZeCom_Duplicate_Flag"] != "").sum())
 
@@ -305,10 +466,6 @@ s3.metric("Color No not found in ZeCom", no_zecom_match)
 s4.metric("Duplicate ZeCom entries hit", dup_hits)
 
 st.dataframe(final_df.head(20), use_container_width=True, height=350)
-
-# ---------------------------------------------------------------------------
-# Download — same structure as marketplace file, plus new columns
-# ---------------------------------------------------------------------------
 
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as writer:

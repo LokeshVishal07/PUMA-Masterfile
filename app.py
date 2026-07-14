@@ -245,13 +245,33 @@ def configure_file(label, uploaded_file, header_hints, key_prefix, default_sheet
     engine, sheet_names, attempt_log = list_sheets(file_bytes, uploaded_file.name)
 
     if engine is None:
-        st.error(
-            f"**Could not read {label}.** Tried multiple formats and none worked:\n\n"
-            + "\n".join(f"- {a}" for a in attempt_log)
-            + "\n\nIf this is a genuine Excel file, try re-saving it as .xlsx from Excel first. "
-            "If it was exported from a marketplace seller center, some exports are actually "
-            "HTML tables saved with an .xlsx extension — try opening and re-saving it in Excel."
+        all_missing = all(
+            ("not installed" in a) or ("importerror" in a.lower())
+            for a in attempt_log
         )
+        if all_missing:
+            st.error(
+                f"**Could not read {label} — but this isn't a problem with your file.**\n\n"
+                "None of the Excel-reading packages (openpyxl, python-calamine, xlrd, lxml) "
+                "are installed in the Python environment currently running this app:\n\n"
+                + "\n".join(f"- {a}" for a in attempt_log)
+                + "\n\n**Fix:** close the app, then in the same terminal run:\n\n"
+                "```\npython -m pip install -r requirements.txt\n```\n\n"
+                "and relaunch with:\n\n"
+                "```\npython -m streamlit run app.py\n```\n\n"
+                "Using `python -m pip` / `python -m streamlit` (instead of bare `pip` / "
+                "`streamlit`) makes sure both use the same Python interpreter — the usual "
+                "cause is `pip install` landing in a different Python install than the one "
+                "running Streamlit."
+            )
+        else:
+            st.error(
+                f"**Could not read {label}.** Tried multiple formats and none worked:\n\n"
+                + "\n".join(f"- {a}" for a in attempt_log)
+                + "\n\nIf this is a genuine Excel file, try re-saving it as .xlsx from Excel first. "
+                "If it was exported from a marketplace seller center, some exports are actually "
+                "HTML tables saved with an .xlsx extension — try opening and re-saving it in Excel."
+            )
         return None, None
 
     sheet_name = sheet_names[0]

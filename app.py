@@ -26,7 +26,6 @@ v2 changes (built after real ZeCom tracker files were tested):
 
 import io
 import re
-from collections import Counter
 
 import pandas as pd
 import numpy as np
@@ -88,19 +87,42 @@ def list_sheets(file_bytes, filename):
 
 
 @st.cache_data(show_spinner=False)
-def read_raw_grid(file_bytes, filename, engine, sheet_name):
-    """Read a sheet as a raw, header-less grid of strings for header-row inspection."""
+def read_preview(file_bytes, filename, engine, sheet_name, nrows=40):
+    """Cheap, small read — just enough rows to detect the header row and show a preview."""
     bio = io.BytesIO(file_bytes)
     if engine == "csv":
-        raw = pd.read_csv(bio, header=None, dtype=str)
+        raw = pd.read_csv(bio, header=None, dtype=str, nrows=nrows)
     elif engine == "html":
         tables = pd.read_html(bio, header=None)
-        raw = tables[0]
+        raw = tables[0].head(nrows)
         raw.columns = range(raw.shape[1])
     else:
-        raw = pd.read_excel(bio, sheet_name=sheet_name, header=None, dtype=str, engine=engine)
+        raw = pd.read_excel(bio, sheet_name=sheet_name, header=None, dtype=str, engine=engine, nrows=nrows)
         raw.columns = range(raw.shape[1])
     return raw
+
+
+@st.cache_data(show_spinner=False)
+def read_full(file_bytes, filename, engine, sheet_name, header_row):
+    """
+    ONE full read of the whole file/sheet, with pandas applying the header natively
+    (header=N). This is far more memory-efficient than reading a full header-less
+    grid and then slicing/copying it again — that pattern effectively held two full
+    copies of a large file in memory at once, which is the likely cause of the app
+    crashing on Streamlit Cloud's memory-constrained free tier for large exports.
+    dtype=str throughout to preserve leading zeros / exact IDs (e.g. "076646_01").
+    Pandas also automatically de-duplicates repeated column names (Col, Col.1, Col.2...).
+    """
+    bio = io.BytesIO(file_bytes)
+    if engine == "csv":
+        df = pd.read_csv(bio, header=header_row, dtype=str)
+    elif engine == "html":
+        tables = pd.read_html(bio, header=header_row)
+        df = tables[0]
+    else:
+        df = pd.read_excel(bio, sheet_name=sheet_name, header=header_row, dtype=str, engine=engine)
+    df.columns = [str(c) for c in df.columns]
+    return df
 
 
 def excel_col_letter(idx: int) -> str:
@@ -122,50 +144,27 @@ def find_header_row(raw_df: pd.DataFrame, keywords, max_scan=20):
     return best_row
 
 
-def build_headered_df(raw: pd.DataFrame, header_row: int):
+def build_label_map(columns, banner_vals):
     """
-    Turn a raw grid + chosen header row into a usable dataframe where every
-    column name is guaranteed unique, plus a {col_name: display_label} map that
-    folds in the banner text from the row directly above the header (common in
-    ZeCom trackers where a campaign name spans several repeated sub-columns)
-    and the real Excel column letter for traceability back to the source file.
+    Build a {column_name: display_label} map. Column names themselves are already
+    unique (pandas guarantees this via header=N parsing), so this only builds the
+    human-friendly label: real Excel column letter + the banner/campaign text
+    sitting directly above the header (common in ZeCom trackers where one campaign
+    name spans several repeated sub-columns like RRP/SRP/DISC%).
     """
-    banner_row = raw.iloc[header_row - 1].tolist() if header_row > 0 else [None] * raw.shape[1]
-    header_vals = raw.iloc[header_row].tolist()
-
-    raw_names = []
-    for i, h in enumerate(header_vals):
-        h_str = str(h).strip() if pd.notna(h) and str(h).strip().lower() not in ("", "nan", "none") else None
-        raw_names.append(h_str or f"Col_{excel_col_letter(i)}")
-
-    name_counts = Counter(raw_names)
-    seen = Counter()
-    final_names, labels = [], {}
-    for i, name in enumerate(raw_names):
+    labels = {}
+    for i, col in enumerate(columns):
         letter = excel_col_letter(i)
-        banner_val = banner_row[i] if i < len(banner_row) else None
-        banner_str = str(banner_val).strip() if pd.notna(banner_val) and str(banner_val).strip().lower() not in ("", "nan", "none") else ""
-
-        if name_counts[name] > 1:
-            unique_name = f"{name}__{letter}"
-        else:
-            unique_name = name
-        final_names.append(unique_name)
-
-        label = f"{letter}: "
-        if banner_str:
-            label += f"{banner_str} — {name}"
-        else:
-            label += name
-        labels[unique_name] = label
-
-    df = raw.iloc[header_row + 1:].copy()
-    df.columns = final_names
-    # drop fully-empty columns (but keep names unique already established)
-    df = df.dropna(axis=1, how="all")
-    df = df.reset_index(drop=True)
-    labels = {k: v for k, v in labels.items() if k in df.columns}
-    return df, labels
+        banner_val = banner_vals[i] if i < len(banner_vals) else None
+        banner_str = (
+            str(banner_val).strip()
+            if pd.notna(banner_val) and str(banner_val).strip().lower() not in ("", "nan", "none")
+            else ""
+        )
+        display_name = f"Col_{letter}" if str(col).startswith("Unnamed:") else str(col)
+        label = f"{letter}: " + (f"{banner_str} — {display_name}" if banner_str else display_name)
+        labels[col] = label
+    return labels
 
 
 def clean_id_str(val, normalize=False):
@@ -284,7 +283,7 @@ def configure_file(label, uploaded_file, header_hints, key_prefix, default_sheet
                     break
         sheet_name = st.selectbox(f"{label} — sheet", options=sheet_names, index=default_idx, key=f"{key_prefix}_sheet")
 
-    raw = read_raw_grid(file_bytes, uploaded_file.name, engine, sheet_name)
+    raw = read_preview(file_bytes, uploaded_file.name, engine, sheet_name)
 
     auto_header_row = find_header_row(raw, header_hints)
     with st.expander(f"Preview raw rows of {label} (use this to check/pick the header row)"):
@@ -293,13 +292,26 @@ def configure_file(label, uploaded_file, header_hints, key_prefix, default_sheet
     header_row = st.number_input(
         f"{label} — which row number is the actual header? (0 = first row)",
         min_value=0,
-        max_value=max(0, len(raw) - 2),
+        max_value=500,
         value=int(auto_header_row),
         key=f"{key_prefix}_header_row",
         help="Auto-detected based on keyword matches. Override if the tracker layout changed and this guessed wrong.",
     )
+    header_row = int(header_row)
 
-    df, labels = build_headered_df(raw, int(header_row))
+    # If someone picks a header row beyond what the small preview covered, widen
+    # the preview just enough to still read the correct banner row above it.
+    if header_row >= len(raw):
+        raw = read_preview(file_bytes, uploaded_file.name, engine, sheet_name, nrows=header_row + 10)
+
+    df = read_full(file_bytes, uploaded_file.name, engine, sheet_name, header_row)
+    banner_vals = raw.iloc[header_row - 1].tolist() if header_row > 0 else [None] * len(df.columns)
+    labels = build_label_map(df.columns, banner_vals)
+    # Drop fully-empty columns only after labels are built against original positions,
+    # so Excel-letter/banner labels stay correctly aligned (dropping first would shift
+    # positions and silently corrupt the labels of every column after a dropped one).
+    df = df.dropna(axis=1, how="all")
+    labels = {k: v for k, v in labels.items() if k in df.columns}
     return df, labels
 
 
